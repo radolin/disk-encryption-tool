@@ -33,7 +33,8 @@ if [ ! -e /sysroot/var/lib/YaST2/reconfig_system ] && [ "$encrypt" != "force" ];
 	exit 0
 fi
 umount /sysroot/var
-
+# we need to unmount root too, so that sfdisk doesn't complain the device is in use
+umount /sysroot
 # silence systemd
 kill -SIGRTMIN+21 1
 inhibitor=
@@ -43,7 +44,20 @@ if [ "$encrypt" != "force" ]; then
 	echo
 fi
 if [ "$inhibitor" != $'\e' ]; then
-	/usr/bin/disk-encryption-tool -v --gen-key || die "Encryption failed"
+	if get_credential partitions disk-encryption-tool-dracut.extra-partitions; then
+	#the expected format is a list of extra partitions to be encrypted in the form:
+	#/dev/vda4@cr_home /dev/vda5@cr_var ....
+        echo "Partitions:"
+        echo $partitions
+	for partition in "$partitions"; do
+		device=${partition%@*}
+		volume_name=${partition#*@}
+		/usr/bin/disk-encryption-tool -v --gen-key "$device" "$volume_name" || die "Encryption failed"
+	done
+        fi
+
+        systemctl start sysroot.mount
+        /usr/bin/disk-encryption-tool -v --gen-key || die "Encryption failed"
 fi
 # turn messages on again
 kill -SIGRTMIN+20 1

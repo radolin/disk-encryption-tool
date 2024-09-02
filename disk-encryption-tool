@@ -13,7 +13,7 @@ prime=
 gen_key=
 
 switched_rw=
-cr_name='cr_root'
+cr_name=
 cr_dev=
 blkdev=
 blkpart=
@@ -56,7 +56,7 @@ trap cleanup EXIT
 helpandquit()
 {
 	cat <<-EOF
-		Usage: $0 [OPTIONS] IMAGE|BLOCKDEV
+		Usage: $0 [OPTIONS] IMAGE|BLOCKDEV VOLUME_NAME
 
 		Encrypt IMAGE or BLOCKDEV
 
@@ -241,9 +241,11 @@ while true ; do
         esac
 done
 
-[ -z "$1" ] && [ -e /etc/initrd-release ] && set -- /sysroot
+[ -z "$1" ] && [ -e /etc/initrd-release ] && set -- /sysroot cr_root
 
-[ -n "$1" ] || helpandquit
+[ -n "$1" -a -n "$2" ] || helpandquit
+
+cr_name="$2"
 
 [ -z "$prime" ] && [ -e "/dev/mapper/$cr_name" ] && err "$cr_name exists. Exit."
 
@@ -280,6 +282,8 @@ else
 	esac
 	blkpart="${blkdev}p${partno}"
 fi
+
+shift
 shift
 
 eval "$(blkid -c /dev/null -o export "$blkpart"|sed 's/^/loop_/')"
@@ -357,10 +361,16 @@ udevadm settle
 
 if [ -n "$gen_key" ]; then
 	read -r password < <(generate-recovery-key)
-	echo -e "Recovery key: \e[1m$password\e[m"
 	if [ -e /etc/initrd-release ]; then
-		read -r key_id < <(echo -n "$password" | keyctl padd user cryptenroll @u)
+		#when multiple partitions are being encrypted we want to generete tne key
+		#only once for the first one and then reuse it if it already exists
+		if key_id=$(keyctl search @u user cryptenroll); then
+			password=$(keyctl link @u @s && keyctl print "$key_id")
+		else
+		        read -r key_id < <(echo -n "$password" | keyctl padd user cryptenroll @u)
+		fi
 	fi
+	echo -e "Recovery key: \e[1m$password\e[m"
 fi
 
 echo "Encrypting..."
@@ -375,6 +385,7 @@ if [ -e /etc/initrd-release ]; then
 fi
 
 if [ -z "$mounted" ]; then
+	mkdir /mnt
 	mount -o rw "$cr_dev" "/mnt"
 	mp="/mnt"
 else
@@ -394,14 +405,28 @@ btrfs filesystem resize max "$mp"
 make_rw
 
 declare loop_UUID
+declare crypttab_line
+
 eval "$(blkid -c /dev/null -o export "$blkpart"|sed 's/^/loop_/')"
 if [ -n "$loop_UUID" ]; then
-	echo "$cr_name /dev/disk/by-uuid/$loop_UUID none x-initrd.attach" > "$mp"/etc/crypttab
+	crypttab_line="$cr_name /dev/disk/by-uuid/$loop_UUID none x-initrd.attach"
 else
 	warn "Can't determine device UUID. Can't generate crypttab"
 fi
 
+if [ "$cr_name" != cr_root ]; then
+	# we collect the crypttab entries here and finally move them
+	# to /etc when cr_root is processed
+        [ -n "$crypttab_line" ] && echo $crypttab_line >> /tmp/crypttab
+else
+
 mountstuff
+
+if [ -f "/tmp/crypttab" ]; then
+	mv /tmp/crypttab "$mp"/etc/crypttab
+fi
+
+echo "$cr_name /dev/disk/by-uuid/$loop_UUID none x-initrd.attach" >> "$mp"/etc/crypttab
 
 if grep -q "LOADER_TYPE.*grub2" "$mp"/etc/sysconfig/bootloader; then
 	log_info "Update bootloader"
@@ -431,6 +456,7 @@ elif [ -e "$mp/etc/kernel/entry-token" ]; then
 else
 	log_info "unsupported boot loader"
 	grep LOADER_TYPE "$mp"/etc/sysconfig/bootloader
+fi
 fi
 
 # A new initrd is created as side effect of the enrolment
